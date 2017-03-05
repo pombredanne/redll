@@ -1,0 +1,23 @@
+language: python
+os:
+  - linux
+python:
+  - 3.4
+  - 3.5
+sudo: false
+addons:
+  apt:
+    packages:
+      - wine
+
+matrix:
+  include:
+    - os: osx
+      language: generic
+      env: MACPYTHON=3.4.4
+    - os: osx
+      language: generic
+      env: MACPYTHON=3.5.2
+
+script:
+  - ./.travis.sh

@@ -1,7 +1,7 @@
 import struct
 from io import BytesIO
-from collections import namedtuple
 import warnings
+import attr
 
 from .pe_info import (
     IMAGE_SCN_CNT_INITIALIZED_DATA,
@@ -15,9 +15,11 @@ from .pe_info import (
     SECTION_TABLE_ENTRY,
     IMPORT_DIRECTORY_TABLE,
     DELAY_LOAD_DIRECTORY_TABLE,
+    DATA_DIRECTORY_EXPORT_TABLE,
+    EXPORT_DIRECTORY_TABLE,
     )
 
-from .util import round_to_next
+from .util import round_to_next, read_asciiz
 
 # Theory of operation
 # ===================
@@ -52,7 +54,7 @@ from .util import round_to_next
 #
 # Once the file has been loaded into memory, then the real fun starts: there
 # are a bunch of complicated pointer-filled structures defined inside that
-# data, including
+# data, including the import tables.
 #
 # Therefore, our basic plan is:
 # 1) Add our new string "BAR.DLL" to the end of the file.
@@ -91,7 +93,7 @@ def view_optional_header(coff_header):
     if size < OPTIONAL_HEADER_32.size:
         raise BadFile("PE optional header missing or too short ({} bytes)"
                       .format(size))
-    optional_header = OPTIONAL_HEADER_32.view(buf, coff_header.next_offset)
+    optional_header = OPTIONAL_HEADER_32.view(buf, coff_header.end_offset)
     if optional_header["Magic"] == OPTIONAL_MAGIC_32:
         pass
     elif optional_header["Magic"] == OPTIONAL_MAGIC_64:
@@ -99,36 +101,28 @@ def view_optional_header(coff_header):
             raise BadFile(
                 "PE optional header too short for 64-bit file ({} bytes)"
                 .format(size))
-        optional_header = OPTIONAL_HEADER_64.view(buf, coff_header.next_offset)
+        optional_header = OPTIONAL_HEADER_64.view(buf, coff_header.end_offset)
     else:
         raise BadFile("unrecognized magic in optional header: {:#04x}"
                       .format(optional_header["Magic"]))
     return optional_header
 
-def _view_array(struct_type, buf, offset, count):
-    views = []
-    next_offset = offset
-    for i in range(count):
-        view = struct_type.view(buf, next_offset)
-        views.append(view)
-        next_offset = view.next_offset
-    return views
-
 def view_data_directories(optional_header):
-    return _view_array(DATA_DIRECTORY,
-                       optional_header.buf, optional_header.next_offset,
-                       optional_header["NumberOfRvaAndSizes"])
+    return DATA_DIRECTORY.view_array(
+        optional_header.buf, optional_header.end_offset,
+        optional_header["NumberOfRvaAndSizes"])
 
 def view_sections(coff_header, data_directories):
-    return _view_array(SECTION_TABLE_ENTRY,
-                       coff_header.buf, data_directories[-1].next_offset,
-                       coff_header["NumberOfSections"])
+    return SECTION_TABLE_ENTRY.view_array(
+        coff_header.buf, data_directories[-1].end_offset,
+        coff_header["NumberOfSections"])
 
-PEHeaders = namedtuple("PE_HEADERS",
-                       ["coff_header",
-                        "optional_header",
-                        "data_directories",
-                        "sections"])
+@attr.s(slots=True)
+class PEHeaders:
+    coff_header = attr.ib()
+    optional_header = attr.ib()
+    data_directories = attr.ib()
+    sections = attr.ib()
 
 def view_pe_headers(buf):
     coff_header = view_coff_header(buf)
@@ -176,14 +170,6 @@ def file_offset_to_rva(sections, offset):
                          "VirtualAddress", "VirtualSize",
                          "file offset")
 
-def get_asciiz(buf, offset):
-    asciiz = b""
-    # next line will break on py2:
-    while buf[offset]:
-        asciiz += buf[offset:offset+1]
-        offset += 1
-    return asciiz
-
 def _data_directory_offset(pe_headers, data_directory_index):
     data_directory = pe_headers.data_directories[data_directory_index]
     if not data_directory["Size"]:
@@ -200,7 +186,7 @@ def _view_null_terminated_array(buf, offset, struct_type, null_field):
         if entry[null_field]:
             # this one is valid
             array.append(entry)
-            offset = entry.next_offset
+            offset = entry.end_offset
         else:
             # this one is null -- we're done
             return array
@@ -211,6 +197,23 @@ def view_import_directory_tables(pe_headers):
     return _view_null_terminated_array(buf, offset,
                                        IMPORT_DIRECTORY_TABLE,
                                        "Import Lookup Table RVA")
+
+def view_export_directory_table(pe_headers):
+    buf = pe_headers.coff_header.buf
+    offset = _data_directory_offset(pe_headers, DATA_DIRECTORY_EXPORT_TABLE)
+    return EXPORT_DIRECTORY_TABLE.view(buf, offset)
+
+def export_names(pe_headers):
+    buf = pe_headers.coff_header.buf
+    edt = view_export_directory_table(pe_headers)
+    print(pe_headers.sections)
+    print(edt)
+    names = rva_to_file_offset(pe_headers.sections, edt["Name Pointer RVA"])
+    for i in range(edt["Number of Name Pointers"]):
+        (name_rva,) = struct.unpack_from("<I", buf, names + 4*i)
+        name_offset = rva_to_file_offset(pe_headers.sections, name_rva)
+        name, _ = read_asciiz(buf, name_offset)
+        yield name
 
 def view_delay_load_directory_tables(pe_headers):
     buf = pe_headers.coff_header.buf
@@ -248,7 +251,7 @@ def add_section(orig_buf, data, characteristics):
             "etc. Sorry, I can't help you."
             .format(max_offset, len(orig_buf)))
 
-    end_of_sections = orig_pe_headers.sections[-1].next_offset
+    end_of_sections = orig_pe_headers.sections[-1].end_offset
     new_writer = BytesIO()
     # Copy over existing headers
     new_writer.write(orig_buf[:end_of_sections])
@@ -334,8 +337,8 @@ def redll(buf, mapping):
         section_offset_mapping[old_dll] = data_offset
     data = data_writer.getbuffer()
 
-    # I check python27.dll, and its DLL name RVAs point into section .rdata
-    # which has characteristic:
+    # I checked python27.dll, and its DLL name RVAs point into section .rdata
+    # which has characteristics:
     #   0x40000040
     # = 0x40000000  IMAGE_SCN_MEM_READ
     # +         40  IMAGE_SCN_CNT_INITIALIZED_DATA
@@ -352,7 +355,7 @@ def redll(buf, mapping):
     def rewrite_names(viewer, name_field):
         for s in viewer(pe_headers):
             name_offset = rva_to_file_offset(pe_headers.sections, s[name_field])
-            name = get_asciiz(new_buf, name_offset)
+            name, _ = read_asciiz(new_buf, name_offset)
             # lowercase name for case-insensitive matching
             name = name.decode("ascii").lower().encode("ascii")
             if name in rva_mapping:
